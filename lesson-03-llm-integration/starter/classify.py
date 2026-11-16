@@ -8,23 +8,21 @@ from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
 from pydantic import BaseModel, Field, ValidationError
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 # TODO 1: switch to a cheaper or local model (see the commented lines below)
-BASE_URL = "https://openrouter.ai/api/v1"
-API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL = "openai/gpt-4o-mini"
+# BASE_URL = "https://openrouter.ai/api/v1"
+# API_KEY = os.getenv("OPENROUTER_API_KEY")
+# MODEL = "openai/gpt-4o-mini" #"meta-llama/llama-3.1-8b-instruct"
 
-# MODEL = "meta-llama/llama-3.1-8b-instruct"
+BASE_URL = "http://localhost:11434/v1"
+API_KEY = "ollama"
+MODEL = "llama3.2:3b"
 
-# BASE_URL = "http://localhost:11434/v1"
-# API_KEY = "ollama"
-# MODEL = "llama3.2:3b"
-
-# TODO 2: add the price of your model, $ per 1M tokens (input, output)
 PRICES = {
     "openai/gpt-4o-mini": (0.15, 0.60),
     "meta-llama/llama-3.1-8b-instruct": (0.05, 0.08),
+    "ollama/llama3.2:3b": (0.02, 0.04),
 }
 
 DATA = Path(__file__).resolve().parent.parent / "data" / "tickets.json"
@@ -59,7 +57,13 @@ def classify(client: OpenAI, text: str) -> dict:
                 {"role": "user", "content": text},
             ],
             temperature=0,
-            # TODO 3: request structured output — pass response_format with the JSON Schema of Ticket
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "ticket",
+                    "schema": Ticket.model_json_schema(),
+                },
+            },
         )
     except OpenAIError as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}", "seconds": time.perf_counter() - start}
@@ -72,17 +76,24 @@ def classify(client: OpenAI, text: str) -> dict:
         "output_tokens": r.usage.completion_tokens if r.usage else 0,
         "raw": content,
     }
-    # TODO 4: validate content with Ticket.
-    # On success set result["ticket"] and result["ok"] = True,
-    # on ValidationError set result["ok"] = False and result["error"].
-    result["ok"] = False
-    result["error"] = "response is not validated yet (TODO 4)"
+    try:
+        result["ticket"] = Ticket.model_validate_json(content)
+        result["ok"] = True
+    except ValidationError as e:
+        result["ok"] = False
+        result["error"] = str(e)
+        result["ticket"] = None
+
     return result
 
 
 def cost_usd(input_tokens: int, output_tokens: int) -> float:
-    # TODO 5: return the cost in USD using PRICES[MODEL] (prices are per 1M tokens)
-    return 0.0
+    prices = PRICES.get(MODEL)
+    if prices is None:
+        return 0.0
+
+    input_price, output_price = prices
+    return (input_tokens * input_price + output_tokens * output_price) / 1_000_000
 
 
 def main() -> None:
@@ -91,13 +102,13 @@ def main() -> None:
     if "localhost" not in BASE_URL and MODEL not in PRICES:
         print(f"Warning: no price for {MODEL} in PRICES, cost will be 0 (TODO 2)\n")
 
-    # TODO 6: add a timeout and automatic retries to the client
-    client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+    client = OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=60, max_retries=2)
     tickets = json.loads(DATA.read_text(encoding="utf-8"))
 
     print(f"Model: {MODEL}  ·  {BASE_URL}\n")
     total_s = total_cost = 0.0
     valid = correct = 0
+    invented_order_ids = 0
 
     for t in tickets:
         res = classify(client, t["text"])
@@ -109,17 +120,18 @@ def main() -> None:
             tk = res["ticket"]
             valid += 1
             correct += tk.category == t["expected_category"]
+            if tk.order_id and tk.order_id not in t["text"]:
+                invented_order_ids += 1
             mark = "✓" if tk.category == t["expected_category"] else f"✗ (expected {t['expected_category']})"
             print(f"#{t['id']}  {res['seconds']:.1f}s  {tk.category:<9} {mark}  {tk.priority:<6}  "
                   f"order_id={tk.order_id}  {tk.summary}")
         else:
             print(f"#{t['id']}  {res['seconds']:.1f}s  ERROR: {res['error']}")
 
-    # TODO 7 (optional): count how many times the model invented an order_id that is not in the text
-
     n = len(tickets)
     print(f"\nFOR CHAT: {MODEL} | {n} requests | {total_s:.1f}s | ${total_cost:.6f} | "
-          f"valid JSON {valid}/{n} | category {correct}/{n}")
+            f"valid JSON {valid}/{n} | category {correct}/{n} | "
+            f"invented order_id {invented_order_ids}")
 
 
 if __name__ == "__main__":

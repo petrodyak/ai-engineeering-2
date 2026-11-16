@@ -19,7 +19,7 @@ from pathlib import Path
 
 import tiktoken
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import APIConnectionError, OpenAI
 from pydantic import BaseModel, ConfigDict
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT))
 from retrieval import Retriever, load_chunks  # noqa: E402
 
 load_dotenv(ROOT / ".env")
+load_dotenv(ROOT.parent / ".env")   # shared course .env (ai-engineeering-2/.env); does not override the lesson one
 
 QUESTIONS = ROOT / "data" / "questions.json"
 SUMMARY_TASK = ROOT / "data" / "summary_task.json"
@@ -37,13 +38,14 @@ BASE_URL = "https://openrouter.ai/api/v1"
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 MODEL = "openai/gpt-4o-mini"
 PRICE_IN, PRICE_OUT = 0.15, 0.60          # USD per 1M tokens, check openrouter.ai/models before you rely on it
+RECONNECTS = 8                            # new connections to try when the network drops one (LLM.chat)
 # Local model instead (lesson 3): ollama pull llama3.2:3b
 # BASE_URL, API_KEY, MODEL, PRICE_IN, PRICE_OUT = "http://localhost:11434/v1", "ollama", "llama3.2:3b", 0, 0
 
 K = 5                      # how many chunks retrieval returns
 CONTEXT_BUDGET = 1500      # max tokens of sources we put into the prompt
 MAP_BUDGET = 1500          # tokens of document text per map call (TODO 8)
-PROMPT_VERSION = "v1"      # TODO 6: write prompts/v2/system.txt, then switch to "v2"
+PROMPT_VERSION = "v2"      # TODO 6: v2 beat v1 on the same 23 questions (correct 0.84 -> 0.89), see prompts/CHANGELOG.md
 HELPERS = "v2"             # condense / map / reduce prompts are ready in prompts/v2
 NOT_FOUND = "I could not find this in the documents available to you."
 
@@ -71,12 +73,26 @@ class LLM:
     def __init__(self):
         if not API_KEY:
             raise SystemExit("OPENROUTER_API_KEY is missing: copy .env.example to .env and paste your key")
-        self.client = OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=60, max_retries=2)
+        self.connect()
         self.calls, self.tokens_in, self.tokens_out = 0, 0, 0
 
+    def connect(self):
+        # A new client means a new TCP + TLS connection instead of the pooled (keep-alive) one.
+        self.client = OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=60, max_retries=2)
+
     def chat(self, messages: list[dict], schema: dict | None = None, max_tokens: int = 500) -> str:
-        r = self.client.chat.completions.create(model=MODEL, messages=messages, temperature=0,
-                                                max_tokens=max_tokens, **({"response_format": schema} if schema else {}))
+        for attempt in range(RECONNECTS + 1):
+            try:
+                r = self.client.chat.completions.create(model=MODEL, messages=messages, temperature=0, max_tokens=max_tokens,
+                                                        **({"response_format": schema} if schema else {}))
+                break
+            except APIConnectionError:
+                # A flaky network can break the connection ("bad record mac"): reconnect, wait, try again.
+                if attempt == RECONNECTS:
+                    raise
+                print(f"  [network] connection error, reconnecting ({attempt + 1}/{RECONNECTS})", file=sys.stderr)
+                self.connect()
+                time.sleep(2 + 2 * attempt)
         self.calls += 1
         if r.usage:
             self.tokens_in += r.usage.prompt_tokens
@@ -103,7 +119,23 @@ def load_prompt(version: str, name: str = "system") -> str:
 #   within the budget: a chunk that does not fit is skipped, a smaller one after it may still go in (check 1).
 def build_context(hits: list[dict], budget: int = CONTEXT_BUDGET) -> tuple[str, dict]:
     """TODO 1: return the context text and {label: chunk} for the chunks that fit into `budget` tokens."""
-    raise NotImplementedError("TODO 1: build_context")
+    sep = "\n\n"
+    blocks, sources, used = [], {}, 0
+    for h in hits:
+        # Header: label, document, section (if any) and date, so the model can cite and prefer newer sources.
+        label = f"S{len(sources) + 1}"
+        meta = " · ".join(p for p in (h["source"], h.get("section"), h.get("effective")) if p)
+        block = f"[{label}] {meta}\n{h['text'].strip()}"
+        # Cost of this block in tokens, plus the separator if it is not the first block.
+        cost = count_tokens(block) + (count_tokens(sep) if blocks else 0)
+        # Too big: skip it (do not stop), a smaller chunk after it may still fit; its label is reused.
+        if used + cost > budget:
+            continue
+        # Fits: keep the block and remember which chunk the label points to (needed for citations, TODO 3).
+        blocks.append(block)
+        sources[label] = h
+        used += cost
+    return sep.join(blocks), sources
 
 
 # ---------------------------------------------------------------- answer
@@ -126,7 +158,19 @@ def generate(llm: LLM, question: str, context: str, system: str) -> Answer:
 #   and found=True with no valid citation becomes found=False (check 3).
 def validate_citations(ans: Answer, sources: dict) -> tuple[Answer, list[str]]:
     """TODO 3: normalize labels ("[S1]" -> "S1"), return the cleaned answer and the dropped (invalid) labels."""
-    raise NotImplementedError("TODO 3: validate_citations")
+    valid, invalid = [], []
+    for c in ans.citations:
+        # Normalize: " [s1] " -> "S1", the model is not always exact about the format.
+        label = c.strip().strip("[]").strip().upper()
+        # Known label: keep it once (no duplicates); unknown one ("S7" of five sources): remember as invalid.
+        if label in sources:
+            if label not in valid:
+                valid.append(label)
+        else:
+            invalid.append(label)
+    # No valid citation left: the answer is not grounded in the sources, so it counts as "not found".
+    found = ans.found and bool(valid)
+    return ans.model_copy(update={"found": found, "citations": valid if found else []}), invalid
 
 
 # TODO 9 · Goal: rewrite a follow-up ("what is their e-mail?") into a question that stands on its own.
@@ -135,7 +179,16 @@ def validate_citations(ans: Answer, sources: dict) -> tuple[Answer, list[str]]:
 #   there is no extra call (check 9). Compare follow-ups with and without --no-condense.
 def condense(llm: LLM, history: list[list[str]], question: str) -> str:
     """TODO 9: one LLM call that returns the standalone question (plain text)."""
-    return question   # TODO 9: replace with the rewriting call; until then follow-ups go to search as they are
+    # No history: the question already stands on its own, no extra call and no cost.
+    if not history:
+        return question
+    # Dialog as text: the last 3 turns are enough to resolve "that" / "their", older turns only add tokens.
+    dialog = "\n".join(f"User: {u}\nAssistant: {a}" for u, a in history[-3:])
+    rewritten = llm.chat([{"role": "system", "content": load_prompt(HELPERS, "condense")},
+                          {"role": "user", "content": f"<dialog>\n{dialog}\n</dialog>\n\nFollow-up: {question}"}],
+                         max_tokens=100).strip()
+    # Empty reply: fall back to the original question instead of searching for nothing.
+    return rewritten or question
 
 
 # TODO 4 · Goal: put the steps together and say "not found" instead of guessing.
@@ -145,7 +198,27 @@ def condense(llm: LLM, history: list[list[str]], question: str) -> str:
 def rag(llm: LLM, retriever, question: str, groups: list[str], history: list | None = None,
         k: int = K, budget: int = CONTEXT_BUDGET, prompt: str = PROMPT_VERSION, use_condense: bool = True) -> dict:
     """TODO 4: condense -> retrieve -> build_context -> generate -> validate_citations -> NOT_FOUND if needed."""
-    raise NotImplementedError("TODO 4: rag")
+    # Condense: a follow-up becomes a standalone question for the search (only when there is a history).
+    query = condense(llm, history, question) if (history and use_condense) else question
+    # Retrieve: top-k chunks the user's groups are allowed to see.
+    hits = retriever.search(query, groups, k=k)
+    result = {"question": question, "query": query, "found": False, "answer": NOT_FOUND,
+              "cited": [], "invalid": [], "retrieved": [h["chunk_id"] for h in hits], "in_context": []}
+    # Nothing found: answer NOT_FOUND right away, no model call, no cost.
+    if not hits:
+        return result
+    # Context: numbered sources within the token budget.
+    context, sources = build_context(hits, budget)
+    result["in_context"] = [c["chunk_id"] for c in sources.values()]
+    # Generate + validate: the model answers from the sources, then we keep only citations that really exist.
+    ans, invalid = validate_citations(generate(llm, query, context, load_prompt(prompt)), sources)
+    result["invalid"] = invalid
+    # Not found (by the model or because no valid citation left): NOT_FOUND instead of a guess.
+    if not ans.found:
+        return result
+    # Found: the answer and the chunk ids behind the cited labels (S2 -> its chunk_id).
+    result.update(found=True, answer=ans.answer, cited=[sources[c]["chunk_id"] for c in ans.citations])
+    return result
 
 
 # ---------------------------------------------------------------- evaluation
@@ -163,7 +236,33 @@ def evaluate(results: list[dict], questions: list[dict]) -> dict:
     """TODO 5: for answerable questions: retrieved (a relevant chunk among the retrieved ones), in_context (a relevant
     chunk made it into the context), correct (found and all `must` facts in the answer), cited (a relevant chunk among
     the cited ones), false_abstain (said NOT_FOUND). For no_answer questions: abstain (said NOT_FOUND)."""
-    raise NotImplementedError("TODO 5: evaluate")
+    keys = ("retrieved", "in_context", "correct", "cited", "false_abstain")
+    score, abstained, failed = dict.fromkeys(keys, 0), 0, []
+    answerable = no_answer = 0
+    for r, q in zip(results, questions):
+        # No answer in the documents: the only right reply is NOT_FOUND (abstain).
+        if q["kind"] == "no_answer":
+            no_answer += 1
+            abstained += not r["found"]
+            if r["found"]:
+                failed.append(q["id"])
+            continue
+        # Answerable: check each stage separately to see where it breaks (search, budget, model, citations).
+        answerable += 1
+        relevant = set(q["relevant"])
+        # correct: found and every `must` group matched; a group lists alternatives (["three", "3"]).
+        correct = r["found"] and all(has(r["answer"], group) for group in q.get("must", []))
+        score["retrieved"] += bool(relevant & set(r["retrieved"]))
+        score["in_context"] += bool(relevant & set(r["in_context"]))
+        score["correct"] += correct
+        score["cited"] += bool(relevant & set(r["cited"]))
+        score["false_abstain"] += not r["found"]
+        if not correct:
+            failed.append(q["id"])
+    # Shares instead of counts (max(.., 1): no division by zero on a set without one of the kinds).
+    m = {k: v / max(answerable, 1) for k, v in score.items()}
+    m.update(abstain=abstained / max(no_answer, 1), failed=failed)
+    return m
 
 
 def run_all(llm: LLM, retriever, questions: list[dict], verbose: bool = True, **kw) -> tuple[list, dict]:
@@ -191,7 +290,16 @@ def run_all(llm: LLM, retriever, questions: list[dict], verbose: bool = True, **
 #   Done when: --sweep prints one row per k with correct, cited, abstain, tokens, $/1000 and ms (check 7).
 def sweep(llm: LLM, retriever, questions: list[dict], ks=(3, 5, 10)) -> list[dict]:
     """TODO 7: run_all for every k with a budget big enough for k chunks; return one row per k."""
-    raise NotImplementedError("TODO 7: sweep")
+    per_chunk = CONTEXT_BUDGET // K   # 300 tokens per chunk: the same share as the default k=5 / 1500 tokens
+    rows = []
+    for k in ks:
+        # The budget grows with k, otherwise the extra chunks are retrieved but cut off and k changes nothing.
+        budget = per_chunk * k
+        print(f"k={k}, budget {budget} tokens ...", file=sys.stderr)
+        # Same questions, same prompt, only k and the budget change: the difference in metrics comes from k.
+        _, m = run_all(llm, retriever, questions, verbose=False, k=k, budget=budget)
+        rows.append({"k": k, "budget": budget, **m})
+    return rows
 
 
 # ---------------------------------------------------------------- more data than the window
@@ -216,7 +324,24 @@ def windows(chunks: list[dict], budget: int) -> list[list[dict]]:
 #   --summary shows the coverage of facts for top-k and for map-reduce.
 def map_reduce(llm: LLM, question: str, chunks: list[dict], budget: int = MAP_BUDGET) -> str:
     """TODO 8: map over windows(chunks, budget) with prompts map.txt, then reduce with reduce.txt."""
-    raise NotImplementedError("TODO 8: map_reduce")
+    map_prompt, reduce_prompt = load_prompt(HELPERS, "map"), load_prompt(HELPERS, "reduce")
+    notes = []
+    for window in windows(chunks, budget):
+        # Map: one call per window; each chunk gets its [chunk_id] so the facts can point back to it.
+        part = "\n\n".join(f"[{c['chunk_id']}] {c.get('section') or ''}\n{c['text'].strip()}" for c in window)
+        reply = llm.chat([{"role": "system", "content": map_prompt},
+                          {"role": "user", "content": f"<part>\n{part}\n</part>\n\nQuestion: {question}"}]).strip()
+        # NONE: nothing relevant in this window, it must not get into reduce as noise.
+        if reply and reply.upper().rstrip(".") != "NONE":
+            notes.append(reply)
+    # No facts in the whole document: nothing to merge, no reduce call.
+    if not notes:
+        return NOT_FOUND
+    # Reduce: one call merges the notes of all windows into the final answer (more room: it lists everything).
+    joined = "\n\n".join(f"Notes {i}:\n{n}" for i, n in enumerate(notes, 1))
+    return llm.chat([{"role": "system", "content": reduce_prompt},
+                     {"role": "user", "content": f"<notes>\n{joined}\n</notes>\n\nQuestion: {question}"}],
+                    max_tokens=1000).strip()
 
 
 def summary_demo(llm: LLM, retriever):

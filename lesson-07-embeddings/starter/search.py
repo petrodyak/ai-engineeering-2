@@ -55,7 +55,36 @@ def embed(texts: list[str]) -> list[list[float]]:
     TODO 2: cache vectors in output/embeddings_cache.json by sha256(model + text): a re-run embeds nothing."""
     # Hint: TextEmbedding(EMBED_MODEL, cache_dir=str(MODELS)).embed(texts) yields numpy arrays; store them as lists of floats.
     # Set embed.last_missing = number of texts that were not in the cache.
-    raise NotImplementedError("TODO 1-2: embed()")
+    global _embedder
+
+    # related to TODO 2: cache key = sha256(model + text). The model is part of the key because vectors of
+    # different models are incompatible: change EMBED_MODEL and every lookup misses.
+    keys = [hashlib.sha256(f"{EMBED_MODEL}\n{t}".encode("utf-8")).hexdigest() for t in texts]
+
+    # related to TODO 2: read the cache from disk ({key: vector}); on the very first run there is no file yet.
+    cache = json.loads(CACHE.read_text(encoding="utf-8")) if CACHE.exists() else {}
+
+    # related to TODO 2: texts whose key is not in the cache; dict keeps the order and drops repeated texts.
+    missing = {k: t for k, t in zip(keys, texts) if k not in cache}
+    embed.last_missing = len(missing)
+
+    if missing:
+        # related to TODO 1: load the model once per process: the first call downloads it into .models/ and takes seconds,
+        # later calls reuse the same object. With a warm cache the model is not loaded at all.
+        if _embedder is None:
+            _embedder = TextEmbedding(EMBED_MODEL, cache_dir=str(MODELS))
+
+        # related to TODO 1: model.embed() is a lazy generator of numpy arrays (384 floats each, same order as its input);
+        # turn every array into a plain list of Python floats so it can be written to JSON.
+        vectors = [[float(x) for x in vec] for vec in _embedder.embed(list(missing.values()))]
+
+        # related to TODO 2: add only the new vectors to the cache and save it, so the next run finds them.
+        cache.update(zip(missing.keys(), vectors))
+        OUT.mkdir(exist_ok=True)
+        CACHE.write_text(json.dumps(cache), encoding="utf-8")
+
+    # related to TODO 2: return vectors in the order of the input texts, whether they came from the cache or were just embedded.
+    return [cache[k] for k in keys]
 
 
 embed.last_missing = 0
@@ -69,7 +98,28 @@ embed.last_missing = 0
 def build_index(chunks: list[dict]) -> QdrantClient:
     """TODO 3: create a Qdrant collection (cosine) and upsert one point per chunk with the chunk as payload."""
     # Hint: QdrantClient(":memory:"), create_collection(..., VectorParams(size, Distance.COSINE)), upsert(PointStruct(...))
-    raise NotImplementedError("TODO 3: build_index()")
+    # related to TODO 3: embed every chunk with its section path in front (contextual header from lesson 6);
+    # thanks to the cache (TODO 2) only new or changed chunks hit the model.
+    vectors = embed([text_for_embedding(c) for c in chunks])
+
+    # related to TODO 3: in-memory Qdrant: no server, the index lives only while the script runs.
+    client = QdrantClient(":memory:")
+
+    # related to TODO 3: the collection must know the vector length (384 for this model) and the metric;
+    # cosine compares directions, so it does not matter that this model's vectors are not normalized.
+    client.create_collection(
+        COLLECTION,
+        vectors_config=models.VectorParams(size=len(vectors[0]), distance=models.Distance.COSINE),
+    )
+
+    # related to TODO 3: one point per chunk: id = position in the list, vector = its embedding,
+    # payload = the whole chunk (text, source, section, access), so a search hit carries everything we need to show it.
+    client.upsert(
+        COLLECTION,
+        points=[models.PointStruct(id=i, vector=vec, payload=chunk)
+                for i, (chunk, vec) in enumerate(zip(chunks, vectors))],
+    )
+    return client
 
 
 # TODO 8 · Goal: a user only gets chunks of the groups they belong to.
@@ -92,7 +142,19 @@ def allowed(chunk: dict, groups: list[str]) -> bool:
 def vector_search(client: QdrantClient, query: str, groups: list[str], k: int = K) -> list[dict]:
     """TODO 4: embed the query with the same model and return the top-k chunks (with "score")."""
     # Hint: client.query_points(COLLECTION, query=<vector>, limit=k, query_filter=access_filter(groups)).points
-    raise NotImplementedError("TODO 4: vector_search()")
+    # related to TODO 4: embed the query with the same embed() as the chunks, so both live in one vector space;
+    # a vector from another model would be compared with chunk vectors meaninglessly.
+    query_vector = embed([query])[0]
+
+    # related to TODO 4: Qdrant returns the k points closest to the query by cosine;
+    # access_filter(groups) runs inside the search, so chunks the user may not read never come back (TODO 8).
+    points = client.query_points(
+        COLLECTION, query=query_vector, limit=k, query_filter=access_filter(groups),
+    ).points
+
+    # related to TODO 4: a hit = the chunk from the payload plus its similarity "score" (higher = closer);
+    # the score is not a probability of a right answer, 0.4-0.6 is normal for this model.
+    return [{**p.payload, "score": p.score} for p in points]
 
 
 def tokenize(text: str) -> list[str]:
@@ -148,7 +210,28 @@ def make_configs(client: QdrantClient, bm25: BM25Index) -> dict:
 #   Done when: the fake test gives recall 0.67 and MRR 0.50 (check 5) and the table shows real numbers per config.
 def evaluate(search, questions: list[dict], k: int = K) -> dict:
     """TODO 5: recall@k (a relevant chunk is in the top-k) and MRR (1 / rank of the first relevant chunk)."""
-    return {"recall": 0.0, "mrr": 0.0, "misses": [q["id"] for q in questions], "ms": 0.0}
+    hits, reciprocal_ranks, misses, elapsed = 0, [], [], 0.0
+    for q in questions:
+        # related to TODO 5: run the search and time it; only the top-k chunk ids matter for the metrics.
+        start = time.perf_counter()
+        top = [h["chunk_id"] for h in search(q["question"], q["groups"])][:k]
+        elapsed += time.perf_counter() - start
+
+        # related to TODO 5: 1-based position of the first relevant chunk in the top-k, None if there is none.
+        rank = next((i for i, cid in enumerate(top, start=1) if cid in q["relevant"]), None)
+
+        # related to TODO 5: recall counts a question as found; MRR adds 1/rank (1st place = 1, 2nd = 0.5, ...),
+        # a miss adds 0 to MRR and its id goes to "misses" so we can see which questions fail.
+        if rank is None:
+            reciprocal_ranks.append(0.0)
+            misses.append(q["id"])
+        else:
+            hits += 1
+            reciprocal_ranks.append(1 / rank)
+
+    # related to TODO 5: average everything over the questions; "ms" is the mean search time per query.
+    n = len(questions)
+    return {"recall": hits / n, "mrr": sum(reciprocal_ranks) / n, "misses": misses, "ms": elapsed / n * 1000}
 
 
 def check_access(client: QdrantClient, bm25: BM25Index) -> bool:

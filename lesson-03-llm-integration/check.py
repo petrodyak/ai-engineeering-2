@@ -1,15 +1,15 @@
 import os, time
+from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 QUESTION = "What is 2 + 2? Answer with a single number."
 
 TARGETS = [
-    ("OpenRouter", "https://openrouter.ai/api/v1",
-     os.getenv("OPENROUTER_API_KEY"), "openai/gpt-4o-mini"),
-    ("Ollama", "http://localhost:11434/v1",
-     "ollama", "llama3.2:3b"),
+    ("OpenRouter", "https://openrouter.ai/api/v1", os.getenv("OPENROUTER_API_KEY"), "openai/gpt-4o-mini"),
+    ("Ollama", "http://localhost:11434/v1", "ollama", "llama3.2:3b"),
+    ("Qwen2", "http://localhost:11434/v1", "qwen2", "qwen2.5:7b")
 ]
 
 for name, base_url, key, model in TARGETS:
